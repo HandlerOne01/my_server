@@ -6,8 +6,8 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
-#include<unistd.h>
-
+#include <unistd.h>
+#include <sys/timerfd.h>
 
 using TaskFunc = std::function<void()>;
 using ReleaseFunc = std::function<void()>;
@@ -17,19 +17,19 @@ class TimerTask
 private:
     uint64_t _id;         // 定时器任务对象ID
     uint32_t _timeout;    // 定时任务的超时时间
-    bool _canceled;  //是否被取消
+    bool _canceled;       // 是否被取消
     TaskFunc _task_cb;    // 定时器对象要执行的任务
     ReleaseFunc _release; // 用于删除TimerWheel中保存的定时器对象信息
 public:
     TimerTask(uint64_t id, uint32_t delay, const TaskFunc &cb)
-        : _id(id), _timeout(delay), _task_cb(cb),_canceled(false) {}
+        : _id(id), _timeout(delay), _task_cb(cb), _canceled(false) {}
     ~TimerTask()
     {
-        if(_canceled == false)
-        _task_cb();
+        if (_canceled == false)
+            _task_cb();
         _release();
     }
-    void Cancel(){_canceled = true;}
+    void Cancel() { _canceled = true; }
     void SetRelease(const ReleaseFunc &cb) { _release = cb; };
 
     uint32_t DalayTime()
@@ -47,6 +47,9 @@ private:
     int _capacity; // 表盘最大数量---其实就是最大延迟时间
     std::vector<std::vector<PtrTask>> _wheel;
     std::unordered_map<uint64_t, WeakTask> _timers;
+    EventLoop *_loop;
+    int _timefd; // 定时器描述符 -- 可读事件回调就是读取计数器，执行定时任务
+    std::unique_ptr<Channel> *_timer_channel;
 
 private:
     void RemoveTimer(uint64_t id)
@@ -58,14 +61,44 @@ private:
         }
     }
 
+    static int CreateTimeFd()
+    {
+        int timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+        if (timerfd < 0)
+        {
+            ERR_LOG("TIMERFD CREATE FAILED!");
+            abort();
+        }
+        struct itimerspec itime;
+        // int timerfd_settime(int fd, int flags,const struct itimerspec *new_value,struct itimerspec *_Nullable old_value);
+        itime.it_interval.tv_sec = 1;
+        itime.it_value.tv_nsec = 0;//第一次超时事件为1s
+        itime.it_interval.tv_sec = 1;
+        itime.it_interval.tv_nsec = 0; //第一次超时后，每次超时的间隔时间
+        timerfd_settime(timerfd,0,&itime,nullptr);
+        return timerfd;
+    }
+
+    void ReadTimeFd()
+    {
+        uint64_t times;
+        int ret = read(timerfd,&time,8);
+        if(ret<0)
+        {
+            ERR_LOG("READ TIMEFD FAILED!");
+            abort();
+        }
+        return;
+    }
+
 public:
-    TimerWheel() : _capacity(60), _tick(0), _wheel(_capacity) {}
+    TimerWheel(EventLoop *loop) : _capacity(60), _tick(0), _wheel(_capacity), _loop(loop), _timefd(CreateTimeFd()),_timer_channel(_loop,_timerfd) {}
     void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) // 添加定时任务
     {
         PtrTask pt(new TimerTask(id, delay, cb));
         pt->SetRelease(std::bind(&TimerWheel::RemoveTimer, this, id)); // 问题：为什么要传this ？为啥要&TimerWheel::RemoveTimer？
-        _timers[id] = WeakTask(pt);                       // 问题：为啥是WeakTask
-        int pos = (_tick+delay)%_capacity;
+        _timers[id] = WeakTask(pt);                                    // 问题：为啥是WeakTask
+        int pos = (_tick + delay) % _capacity;
         _wheel[pos].push_back(pt);
     }
     // 刷新/延迟定时任务
@@ -91,7 +124,8 @@ public:
             return; // 没找到定时任务
         }
         PtrTask pt = it->second.lock();
-        if(pt) pt->Cancel();
+        if (pt)
+            pt->Cancel();
     }
 
     // 这个函数应该每秒执行一次，相当于秒针向后走了一步
@@ -107,7 +141,6 @@ class Test
 public:
     Test() { std::cout << "构造" << std::endl; }
     ~Test() { std::cout << "析构" << std::endl; }
-
 };
 
 void DelTest(Test *t)
@@ -120,20 +153,21 @@ int main()
     TimerWheel tw;
     Test *t = new Test();
 
-    tw.TimerAdd(888,5,std::bind(DelTest,t));
+    tw.TimerAdd(888, 5, std::bind(DelTest, t));
 
-    for(int i=1;i<=5;i++)
+    for (int i = 1; i <= 5; i++)
     {
-        tw.TimerRefresh(888); //刷新定时任务
-        tw.RunTimerTask(); //向后移动秒针
-        std::cout<<"刷新了一下定时任务，重新需要5秒钟后才销毁\n";
+        tw.TimerRefresh(888); // 刷新定时任务
+        tw.RunTimerTask();    // 向后移动秒针
+        std::cout << "刷新了一下定时任务，重新需要5秒钟后才销毁\n";
     }
     tw.TimerCancel(888);
-    while(1)
+    while (1)
     {
         sleep(1);
-        std::cout<<"------------------------------\n";
+        std::cout << "------------------------------\n";
         tw.RunTimerTask();
     }
     return 0;
 }
+/
