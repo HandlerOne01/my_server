@@ -24,6 +24,7 @@
 #include <sys/timerfd.h>
 #include <typeinfo>
 #include <any>
+#include <condition_variable>
 
 #define INF 0
 #define DBG 1
@@ -925,6 +926,94 @@ public:
     bool HasTimer(uint64_t id) { return _timer_wheel.HasTimer(id); }
 };
 
+class LoopThread
+{
+private:
+    /*用于实现_loop获取的同步关系，避免线程创建了，但是_loop还没有实例化之前去获取_loop*/
+    std::mutex _mutex;             // 互斥锁，配合条件变量使用，保护对_loop指针的并发访问
+    std::condition_variable _cond; // 条件变量，用于在主线程和子线程间进行同步
+    EventLoop *_loop;              // EventLoop指针变量，这个对象需要在线程内实例化（指向子线程局部变量）
+    std::thread _thread;
+
+private:
+    /*实例化 EventLoop 对象，唤醒_cond上有可能阻塞的线程，并且开始运行EventLoop模块的功能*/
+    void ThreadEntry()
+    {
+        EventLoop loop;
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _loop = &loop;      // 给成员变量赋值，此时 EventLoop 已经创建完毕
+            _cond.notify_all(); // 唤醒正在 GetLoop() 中阻塞等待的主线程
+        }
+        loop.Start(); // 启动事件循环，开始死循环监听事件，直到循环被停止
+    }
+
+public:
+    /*创建线程，设定线程入口函数*/
+    // 初始化_loop为空，并立即启动底层的std::thread执行ThreadEntry
+    LoopThread() : _loop(nullptr), _thread(std::thread(&LoopThread::ThreadEntry, this)) {}
+
+    // 返回当前线程关联的EventLoop对象指
+    EventLoop *GetLoop()
+    {
+        EventLoop *loop = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            // 如果子线程还没来得及给_loop赋值，调用此函数的线程会释放锁并进入阻塞等待
+            _cond.wait(lock, [&]()
+                       { return _loop != nullptr; }); // loop为NULL就一直阻塞
+            loop = _loop;
+        }
+        return loop;
+    }
+};
+
+class LoopThreadPool
+{
+private:
+    int _thread_count;                  // 线程池中子线程(sub reactor)的数量
+    int _next_idx;                      // 用于轮询(Round-Robin)分发新连接的下一个索引
+    EventLoop *_baseloop;               // 主线程的EventLoop (通常负责监听新连接，即主reactor)
+    std::vector<LoopThread *> _threads; // 管理所有创建出来的 LoopThread 线程对象
+    std::vector<EventLoop *> _loops;    // 缓存各个子线程对应的 EventLoop 指针，方便快速获取
+public:
+    // 构造函数：初始化时默认线程数为0，轮询索引为0，绑定主loop
+    LoopThreadPool(EventLoop *baseloop) : _thread_count(0), _next_idx(0), _baseloop(baseloop) {}
+
+    // 设置线程池的线程数量（需要在调用Create前设置）
+    void SetThreadCount(int count)
+    {
+        _thread_count = count;
+    }
+
+    // 根据指定的线程数量，真正开始创建线程池
+    void Create()
+    {
+        if (_thread_count > 0)
+        {
+            _threads.resize(_thread_count); // 预分配空间
+            _loops.resize(_thread_count);
+            for (int i = 0; i < _thread_count; i++)
+            {
+                _threads[i] = new LoopThread();     // 创建并启动新的子线程
+                _loops[i] = _threads[i]->GetLoop(); // 这里会调用上面写好的获取逻辑，可能发生阻塞，直到第i个子线程的EventLoop创建完毕
+            }
+        }
+        return;
+    }
+
+    // 核心负载均衡功能：获取下一个处理业务的 EventLoop
+    EventLoop *NextLoop()
+    {
+        // 单线程模式：如果没有配置子线程，就全权交由主
+        if (_thread_count == 0)
+            return _baseloop;
+        // 多线程模式：轮询算法，将下一个新连接均匀地分配给下一个子线程
+        _next_idx = (_next_idx + 1) % _thread_count;
+        return _loops[_next_idx];
+    }
+};
+
 class Any
 {
 private:
@@ -1267,10 +1356,11 @@ public:
         _loop->RunInLoop(std::bind(&Connection::ReleaseInLoop, this));
     }
 
-    void Release(){
+    void Release()
+    {
         // 这里强制使用QueueInLoop将释放操作推迟到当前事件循环阶段结束，
-        //防止在其他EventCallback执行中途直接释放掉自身导致野指针崩溃
-        _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop,this));
+        // 防止在其他EventCallback执行中途直接释放掉自身导致野指针崩溃
+        _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop, this));
     }
 
     // 启动非活跃销毁，并定义多长时间无通信就是非活跃，添加定时任务
@@ -1296,4 +1386,52 @@ public:
         _loop->AssertInLoop();
         _loop->RunInLoop(std::bind(&Connection::UpgradeInLoop, this, context, conn, msg, closed, event));
     }
+};
+
+class Acceptor
+{
+private:
+    Socket _socket;   // 用于创建监听套接字
+    EventLoop *_loop; // 用于对监听套接字进行事件监控
+    Channel _channel; // 用于对监听套接字进行事件管理
+
+    using AcceptCallBack = std::function<void(int)>;
+    AcceptCallBack _accept_callback; // 存放处理新连接的上层回调函数
+
+private:
+    /*监听套接字的读事件回调处理函数---获取新连接，调用_accept_callback函数进行新连接处理*/
+    void HandleRead()
+    {
+        int newfd = _socket.Accept(); // 接收新连接，获取客户端的套接字描述符
+        if (newfd < 0)
+        {
+            return; // 接收失败，直接返回
+        }
+        if (_accept_callback)
+            _accept_callback(newfd); // 将新连接交由上层设置的回调函数进行处理
+    }
+
+    // 创建服务器并返回监听套接字的描述符fd
+    int CreateServer(int port)
+    {
+        bool ret = _socket.CreateServer(port);
+        assert(ret == true);
+        return _socket.Fd(); // 返回成功创建的监听套接字描述符
+    }
+
+public:
+    /*不能将启动读事件监控，放到构造函数中，必须在设置回调函数后，再去启动*/
+    /*否则有可能造成启动监控后，立即有事件，处理的时候，回调函数还没设置：新连接得不到处理，且资源泄漏*/
+    Acceptor(EventLoop *loop, int port)
+        : _socket(CreateServer(port)), _loop(loop), _channel(loop, _socket.Fd())
+    {
+        // 将 HandleRead 绑定为当前 Channel 的读事件回调
+        _channel.SetReadCallBack(std::bind(&Acceptor::HandleRead, this));
+    }
+
+    // 提供给上层使用的接口：用于注册自定义的新连接处理逻辑
+    void SetAcceptCallBack(const AcceptCallBack &cb) { _accept_callback = cb; }
+
+    // 启动 Acceptor：使能监听套接字 Channel 的读事件（挂载到 epoll/poll 树上开始监听）
+    void Linst() { _channel.EnableRead(); }
 };
