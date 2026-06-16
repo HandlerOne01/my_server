@@ -22,6 +22,7 @@
 #include <sys/eventfd.h>
 #include <memory>
 #include <sys/timerfd.h>
+#include <signal.h>
 #include <typeinfo>
 #include <any>
 #include <condition_variable>
@@ -1435,3 +1436,134 @@ public:
     // 启动 Acceptor：使能监听套接字 Channel 的读事件（挂载到 epoll/poll 树上开始监听）
     void Linst() { _channel.EnableRead(); }
 };
+
+class TcpServer
+{
+private:
+    uint64_t _next_id;                                  // 自动增长的连接ID，// 也可以借用作为定时器任务的唯一ID
+    int _port;                                          // 服务器监听的端口号
+    int _timeout;                                       // 非活跃连接的统计时间
+    bool _enable_inactive_release;                      // 是否启动了非活跃连接超时销毁的判断标志
+    EventLoop _baseloop;                                // 这是主线程的EventLoop对象，负责监听事件的处理 // 即 Main Reactor，只负责新连接的获取
+    Acceptor _acceptor;                                 // 这是监听套接字的管理对象
+    LoopThreadPool _pool;                               // 这是从属EventLoop线程池 // 即 Sub Reactor 池，负责已连接客户端的读写事件
+    std::unordered_map<uint64_t, PtrConnection> _conns; // 保存管理所有连接对应的shared_ptr对象 // 集中管理，防止连接对象被提前销毁
+
+    // 定义各类事件的回调函数类型，方便上层应用(业务层)注册自定义逻辑
+    using ConnectedCallBack = std::function<void(const PtrConnection &)>;
+    using MessageCallBack = std::function<void(const PtrConnection &, Buffer *)>;
+    using ClosedCallBack = std::function<void(const PtrConnection &)>;
+    using AnyEventCallBack = std::function<void(const PtrConnection &)>;
+    using Functor = std::function<void()>;
+
+    // 保存上层应用注册的业务回调
+    ConnectedCallBack _connected_callback;
+    MessageCallBack _message_callback;
+    ClosedCallBack _closed_callback;
+    AnyEventCallBack _event_callback;
+
+private:
+    // 在住EventLoop线程中真正执行添加定时任务的操作
+    void RunAfterInLoop(const Functor &task, int delay)
+    {
+        _next_id++;
+        _baseloop.TimerAdd(_next_id, delay, task); // 将任务挂载到主loop的定时器中
+    }
+
+    // 为新连接构造一个Connection进行管理
+    void NewConnection(int fd)
+    {
+        _next_id++;
+        // 核心调度：从线程池中轮询获取一个 Sub Reactor，将新连接 fd 交给它管理
+        PtrConnection conn(new Connection(_pool.NextLoop(),_next_id,fd);
+        // 将 TcpServer 收集到的上层业务回调，原封不动地传递给具体的 Connection 对象
+        conn->SetMessageCallBack(_message_callback);
+        conn->SetClosedCallBack(_closed_callback);
+        conn->SetConnectedCallBack(_connected_callback);
+        conn->SetAnyEventCallBack(_event_callback);
+
+        // 设置内部回调：当 Connection 关闭时，通知 TcpServer 将其从 _conns 映射表中彻底移除
+        conn->SetSrvClosedCallBack(std::bind(&TcpServer::RemoveConnection,this,std::placeholders::_1));
+        if(_enable_inactive_release)conn->EnableInactiveRelease(_timeout);//启动非活跃超时销毁
+        conn->Established();//就绪初始化 (通常会在这里触发业务层 connected 回调，并开启读事件监听)
+        _conns.insert(std::make_pair(_next_id,conn));// 存入 map，增加 shared_ptr 的引用计数
+    }
+
+    // 真正执行从 map 中移除连接的操作（必须在主线程执行，保证对 _conns 操作的线程安全）
+    void RemoveConnectionInLoop(const PtrConnection &conn)
+    {
+        int id = conn->Id();
+        auto it = _conns.find(id);
+        if (it != _conns.end())
+        {
+            _conns.erase(it); // 移除后，若无其他引用，Connection 对象将在此处自动析构释放
+        }
+    }
+
+    // 从管理Connection的_conns中移除连接信息
+    void RemoveConnection(const PtrConnection &conn)
+    {
+        // 重点跨线程处理：由于 Connection 的断开往往发生在 Sub Reactor 子线程，
+        // 而 _conns 是属于 TcpServer(主线程) 的数据。为了防止多线程并发修改 map 引发崩溃，
+        // 必须使用 RunInLoop 将“移除操作”作为一个任务投递回主线程的 _baseloop 中执行。
+        _baseloop.RunInLoop(std::bind(&TcpServer::RemoveConnectionInLoop, this, conn));
+    }
+
+public:
+    TcpServer(int port) : _port(port), _next_id(0), _enable_inactive_release(false), _acceptor(&_baseloop, port), _pool(&_baseloop)
+    {
+        // 将 TcpServer 内部的 NewConnection 方法注册给 Acceptor
+        // 当 Acceptor 监听到新连接到来并 accept 成功后，会回调此方法
+        _acceptor.SetAcceptCallBack(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
+        _acceptor.Linst(); // 将监听套接字挂到baseloop上 (开始监听 EPOLLIN 事件)
+    }
+
+    // 设置从属线程池的线程数量（需要在 Start 之前调用）
+    void SetThreadCount(int count) { return _pool.SetThreadCount(count); }
+
+    // 提供给上层组件调用的接口，用于注册业务处理逻辑
+    void SetConnectedCallBack(const ConnectedCallBack &cb) { _connected_callback = cb; }
+    void SetMessageCallBack(const MessageCallBack &cb) { _message_callback = cb; }
+    void SetClosedCallBack(const ClosedCallBack &cb) { _closed_callback = cb; }
+    void SetAnyEventCallBack(const AnyEventCallBack &cb) { _event_callback = cb; }
+
+    // 开启超时踢出机制
+    void EnableInactiveRelease(int timeout)
+    {
+        _timeout = timeout;
+        _enable_inactive_release = true;
+    }
+
+    // 添加一个定时任务
+    void RunAfter(const Functor &task, int delay)
+    {
+        // 同样为了线程安全，将定时任务投递给主循环所在线程去真正添加
+        _baseloop.RunInLoop(std::bind(&TcpServer::RunAfterInLoop, this, task, delay));
+    }
+
+    void Start()
+    {
+        _pool.Create();
+        _baseloop.Start();
+    }
+};
+class NetWork
+{
+public:
+    // 构造函数：用于在网络模块启动前进行一些全局的初始化工作
+    NetWork()
+    {
+        DBG_LOG("SIGPIPE INIT"); // 打印调试日志，表示开始初始化信号处理
+
+        // 忽略 SIGPIPE 信号 (SIG_IGN 表示 Ignore)
+        // 核心原因：在 TCP 网络编程中，如果对端已经关闭了连接，而本端依然尝试向该套接字写入数据，
+        // 操作系统默认会向本端进程发送一个 SIGPIPE 信号。该信号的默认行为是终止整个进程。
+        // 为了防止服务器因此意外崩溃，必须忽略此信号。忽略后，写入操作只会返回 -1 并设置 errno 为 EPIPE。
+        signal(SIGPIPE, SIG_IGN);
+    }
+};
+
+// 实例化一个全局静态对象 nw
+// 原理：C++ 中全局静态对象的构造函数会在主函数 main() 运行之前被系统自动调用。
+// 作用：利用这一特性，确保程序一启动就自动完成了对 SIGPIPE 信号的屏蔽，无需开发者在 main 中手动调用初始化。
+static NetWork nw;
