@@ -114,7 +114,7 @@ public:
         }
         else
         { // 3. 总体空间都不够，直接扩容底层 vector
-            DBG_LOG("RESIZE &ld", _writer_idx + len);
+            DBG_LOG("RESIZE %ld", _writer_idx + len);
             _buffer.resize(_writer_idx + len);
         }
     }
@@ -136,11 +136,16 @@ public:
         MoveWriteOffset(len);
     }
 
-    // 写入std::string 并更新偏移量
-    void WriteAndPush(std::string &data, uint64_t len)
+    void WriteString(const std::string &data)
     {
-        Write(data.c_str(), len);
-        MoveWriteOffset(len);
+        return Write(data.c_str(), data.size());
+    }
+
+    // 写入std::string 并更新偏移量
+    void WriteStringAndPush(std::string &data)
+    {
+        WriteString(data);
+        MoveWriteOffset(data.size());
     }
 
     // 从另一个Buffer 中读取数据并写入当前Buffer
@@ -304,7 +309,7 @@ public:
     }
 
     // 获取新连接
-    bool Accept()
+    int Accept()
     {
         // int accept(int sockfd,struct sockaddr *_Nullable restrict addr,socklen_t *_Nullable restrict addrlen)
         // 返回新的通信套接字
@@ -413,7 +418,7 @@ public:
         int val = 1;
         // 允许TIME_WAIT状态下快速重用地址
         setsockopt(_sockfd, SOL_SOCKET, SO_REUSEADDR, (void *)&val, sizeof(int));
-        int val = 1;
+        val = 1;
         setsockopt(_sockfd, SOL_SOCKET, SO_REUSEPORT, (void *)&val, sizeof(int));
     }
 
@@ -456,7 +461,7 @@ public:
     uint32_t Events() { return _events; }
 
     // 设置实际就绪的事件
-    uint32_t SetREvents(uint32_t events) { _revents = events; }
+    void  SetREvents(uint32_t events) { _revents = events; }
 
     // 注册具体的事件回调函数
     void SetReadCallBack(const EventCallBack &cb) { _read_callback = cb; }
@@ -472,16 +477,32 @@ public:
     bool WriteAble() { return (_events & EPOLLOUT); }
 
     // 启动读事件监控
-    void EnableRead() { _events |= EPOLLIN; }
+    void EnableRead()
+    {
+        _events |= EPOLLIN;
+        Update();
+    }
 
     // 启动写事件监控
-    void EnableWrite() { _events |= EPOLLOUT; }
+    void EnableWrite()
+    {
+        _events |= EPOLLOUT;
+        Update();
+    }
 
     // 关闭读事件监控
-    void DisableRead() { _events &= ~EPOLLIN; }
+    void DisableRead()
+    {
+        _events &= ~EPOLLIN;
+        Update();
+    }
 
     // 关闭写事件监控
-    void DisableWrite() { _events &= ~EPOLLOUT; }
+    void DisableWrite()
+    {
+        _events &= ~EPOLLOUT;
+        Update();
+    }
 
     // 关闭所有事件监控
     void DisableAll()
@@ -618,8 +639,8 @@ public:
             assert(it != _channels.end());          // 断言一定能找到，保证内核通知的 fd 确实由我们在管理
             it->second->SetREvents(_evs[i].events); // 设置实际就绪的事件
             active->push_back(it->second);          // 将准备好的 Channel 添加到 active 列表中，交由上层统一执行回调逻辑
-            return;
         }
+        return;
     }
 };
 
@@ -698,7 +719,7 @@ private:
     int ReadTimeFd()
     {
         uint64_t times;
-        int ret = read(_timerfd, &time, 8);
+        int ret = read(_timerfd, &times, 8);
         if (ret < 0)
         {
             ERR_LOG("READ TIMEFD FAILED!");
@@ -827,7 +848,7 @@ public:
         uint64_t res = 0;
         // 读取 eventfd 中的值，每次读取会将内部计数器清零，从而消除可读事件
         int ret = read(_event_fd, &res, sizeof res);
-        if (res < 0)
+        if (ret < 0)
         {
             if (errno == EINTR || errno == EAGAIN)
                 return;
@@ -1131,7 +1152,7 @@ private:
     {
         // 1.接收socket的数据，放到缓冲区
         char buf[65536];
-        ssize_t ret = _socket.NonBlockRecv(&buf, sizeof buf);
+        ssize_t ret = _socket.NonBlockRecv(buf, sizeof buf);
         if (ret < 0)
         {
             // 出错，但不可直接关闭连接
@@ -1186,7 +1207,7 @@ private:
     // 描述符触发出错事件
     void HandleError()
     {
-        return HandleError();
+        return HandleClose();
     }
 
     // 描述符触发任意事件: 1. 刷新连接的活跃度--延迟定时销毁任务；  2. 调用组件使用者的任意事件回调
@@ -1304,7 +1325,12 @@ private:
 
 public:
     Connection(EventLoop *loop, uint64_t conn_id, int sockfd)
-        : _sockfd(sockfd), _enable_inactive_release(false), _loop(loop), _statu(CONNECTING), _socket(_sockfd), _channel(loop, _sockfd)
+        : _sockfd(sockfd),
+          _enable_inactive_release(false),
+          _loop(loop), _statu(CONNECTING),
+          _socket(_sockfd),
+          _channel(loop, _sockfd),
+          _conn_id(conn_id)
     {
         _channel.SetCloseCallBack(std::bind(&Connection::HandleClose, this));
         _channel.SetEventCallBack(std::bind(&Connection::HandleEvent, this));
@@ -1354,7 +1380,7 @@ public:
     // 提供给组件使用者的关闭接口--并不实际关闭，需要判断有没有数据待处理
     void ShutDown()
     {
-        _loop->RunInLoop(std::bind(&Connection::ReleaseInLoop, this));
+        _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
     }
 
     void Release()
@@ -1475,7 +1501,7 @@ private:
     {
         _next_id++;
         // 核心调度：从线程池中轮询获取一个 Sub Reactor，将新连接 fd 交给它管理
-        PtrConnection conn(new Connection(_pool.NextLoop(),_next_id,fd);
+        PtrConnection conn(new Connection(_pool.NextLoop(), _next_id, fd));
         // 将 TcpServer 收集到的上层业务回调，原封不动地传递给具体的 Connection 对象
         conn->SetMessageCallBack(_message_callback);
         conn->SetClosedCallBack(_closed_callback);
@@ -1483,10 +1509,11 @@ private:
         conn->SetAnyEventCallBack(_event_callback);
 
         // 设置内部回调：当 Connection 关闭时，通知 TcpServer 将其从 _conns 映射表中彻底移除
-        conn->SetSrvClosedCallBack(std::bind(&TcpServer::RemoveConnection,this,std::placeholders::_1));
-        if(_enable_inactive_release)conn->EnableInactiveRelease(_timeout);//启动非活跃超时销毁
-        conn->Established();//就绪初始化 (通常会在这里触发业务层 connected 回调，并开启读事件监听)
-        _conns.insert(std::make_pair(_next_id,conn));// 存入 map，增加 shared_ptr 的引用计数
+        conn->SetSrvClosedCallBack(std::bind(&TcpServer::RemoveConnection, this, std::placeholders::_1));
+        if (_enable_inactive_release)
+            conn->EnableInactiveRelease(_timeout);     // 启动非活跃超时销毁
+        conn->Established();                           // 就绪初始化 (通常会在这里触发业务层 connected 回调，并开启读事件监听)
+        _conns.insert(std::make_pair(_next_id, conn)); // 存入 map，增加 shared_ptr 的引用计数
     }
 
     // 真正执行从 map 中移除连接的操作（必须在主线程执行，保证对 _conns 操作的线程安全）
@@ -1547,6 +1574,35 @@ public:
         _baseloop.Start();
     }
 };
+
+// Channel 并不直接操作底层的 epoll/poll，而是将“移除事件监听”的任务委托给它所绑定的 EventLoop 处理
+void Channel::Remove() { return _loop->RemoveEvent(this); }
+
+// 同理，当 Channel 关注的读写事件发生变化时，交由 EventLoop 去更新底层的监听状态
+void Channel::Update() { return _loop->UpdateEvent(this); }
+
+// TimerWheel 内部的定时器容器（如数组、哈希表）通常是非线程安全的。
+// 为了允许其他线程（比如业务线程或主线程）安全地操作定时器，
+// 必须将实际的添加/刷新/取消操作（InLoop系列函数）打包成任务，投递到 TimerWheel 绑定的 EventLoop 线程中串行执行
+
+// 添加定时任务
+void TimerWheel::TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb)
+{
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerAddInLoop, this, id, delay, cb));
+}
+
+// 刷新/延迟定时任务
+void TimerWheel::TimerRefresh(uint64_t id)
+{
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerRefreshInLoop, this, id));
+}
+
+// 取消定时任务
+void TimerWheel::TimerCancel(uint64_t id)
+{
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
+}
+
 class NetWork
 {
 public:
