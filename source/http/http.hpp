@@ -208,14 +208,310 @@ public:
             printf("OPEN %s FILE FAILED!!", filename.c_str());
             return false;
         }
-        ofs.write(buf.c_str(),buf.size());// 将buf中的数据写入文件
-        if(ofs.good()==false)
+        ofs.write(buf.c_str(), buf.size()); // 将buf中的数据写入文件
+        if (ofs.good() == false)
         {
             ERR_LOG("WRITE %s FILE FAILED!", filename.c_str());
-                ofs.close();    
-                return false;
+            ofs.close();
+            return false;
         }
         ofs.close();
+        return true;
+    }
+
+    // URL编码，避免URL中资源路径与查询字符串中的特殊字符与HTTP请求中特殊字符产生歧义
+    // 编码格式：将特殊字符的ascii值，转换为两个16进制字符，前缀%   C++ -> C%2B%2B
+    //   不编码的特殊字符： RFC3986文档规定 . - _ ~ 字母，数字属于绝对不编码字符
+    // RFC3986文档规定，编码格式 %HH
+    // W3C标准中规定，查询字符串中的空格，需要编码为+， 解码则是+转空格
+    static std::string UrlEncode(const std::string url, bool convert_space_to_plus)
+    {
+        std::string res;
+        for (auto &c : url)
+        {
+            // 绝对不编码的字符直接累加
+            if (c == '.' || c == '-' || c == '_' || c == '~' || isalnum(c))
+            {
+                res += c;
+                continue;
+            }
+            // 处理空格字符的特殊转换
+            if (c == ' ' && convert_space_to_plus)
+            {
+                res += "+";
+                continue;
+            }
+            // 剩下的字符都是需要编码成为%HH格式
+            char tmp[4] = {0};
+            snprintf(tmp, 4, "%%%02x", c);
+            res += tmp;
+        }
+        return res;
+    }
+
+    // 辅助函数：将单个十六进制字符转换为对应的十进制整数 (0-15)
+    // 十六进制字符可能是 `'0'~'9'`、`'a'~'f'`、或 `'A'~'F'`，三段在 ASCII 里不连续，所以要写判断
+    static char HEXTOT(char c)
+    {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        else if (c >= 'a' && c <= 'z')
+            return c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z')
+            return c - 'A' + 10;
+        return -1;
+    }
+
+    static std::string UrlDecode(const std::string url, bool convert_plus_to_space)
+    {
+        // 遇到了%，则将紧随其后的2个字符，转换为数字，第一个数字左移4位，然后加上第二个数字  + -> 2b  %2b->2 << 4 + 11
+        std::string res;
+        for (int i = 0; i < url.size(); i++)
+        {
+            if (url[i] == '+' && convert_plus_to_space)
+            {
+                res += " ";
+                continue;
+            }
+            // 处理%HH格式的解码
+            if (url[i] == '%' && (i + 2) < url.size())
+            {
+                char v1 = HEXTOT(url[i + 1]);
+                char v2 = HEXTOT(url[i + 2]);
+                char v = v1 * 16 + v2;
+                res += v;
+                i += 2;
+                continue;
+            }
+            // 其他不需要解码的字符直接追加
+            res += url[i];
+        }
+        return res;
+    }
+
+    // 响应状态码的描述信息获取
+    static std::string StatuDesc(int statu)
+    {
+        auto it = _statu_msg.find(statu);
+        if (it != _statu_msg.end())
+            return it->second;
+        return "Unknow";
+    }
+
+    // 根据文件后缀名获取文件mine
+    static std::string ExtMine(const std::string &filename)
+    {
+        // a.b.txt  先获取文件扩展名
+        size_t pos = filename.find_last_of('.');
+        if (pos == std::string::npos)
+            return "application/octet-stream"; // 如果没有后缀，返回默认的二进制流类型
+        std::string ext = filename.substr(pos);
+        auto it = _mime_msg.find(ext);
+        if (it == _mime_msg.end())
+            return "application/octet-stream"; // 找不到对应后缀的类型，返回默认二进制流类型
+        return it->second;
+    }
+
+    // 判断一个文件是否为一个目录
+    static bool IsDirectory(const std::string &filename)
+    {
+        struct stat st;
+        int ret = stat(filename.c_str(), &st); // 获取文件属性
+        if (ret < 0)
+            return false;
+        return S_ISDIR(st.st_mode);
+    }
+
+    // 判断一个文件是否为普通文件
+    static bool IsRegular(const std::string &filename)
+    {
+        struct stat st;
+        int ret = stat(filename.c_str(), &st);
+        if (ret < 0)
+            return false;
+        return S_ISREG(st.st_mode);
+    }
+
+    // http请求的资源路径有效性判断
+    // 客户端只能请求相对根目录中的资源，其他地方的资源都不予理会
+    // /../login, 这个路径中的..会让路径的查找跑到相对根目录之外，这是不合理的，不安全的
+    static bool VaildPath(const std::string &path)
+    {
+        std::vector<std::string> subdir;
+        Split(path, "/", &subdir);
+        int level = 0;
+        for (auto &dir : subdir)
+        {
+            if (dir == "..")
+            {
+                level--;
+                if (level < 0)
+                    return false;
+                continue;
+            }
+            level++;
+        }
+        return true;
+    }
+};
+
+class HttpRequest
+{
+public:
+    std::string _method;                                   // 请求方法
+    std::string _path;                                     // 资源路径
+    std::string _version;                                  // 协议版本
+    std::string _body;                                     // 请求正文
+    std::smatch _matches;                                  // 资源路径的正则提取数据
+    std::unordered_map<std::string, std::string> _headers; // 头部字段
+    std::unordered_map<std::string, std::string> _params;  // 查询字符串
+
+public:
+    HttpRequest() : _version("HTTP/1.1") {}
+
+    // 重置数据
+    void ReSet()
+    {
+        _method.clear();
+        _path.clear();
+        _version = "HTTP/1.1";
+        _body.clear();
+        std::smatch match;
+        _matches.swap(match);
+        _headers.clear();
+        _params.clear();
+    }
+
+    // 插入头部字段
+    void SetHeader(const std::string &key, const std::string &val)
+    {
+        _headers.insert(std::make_pair(key, val));
+    }
+
+    // 判断是否存在指定头部字段
+    bool HasHeader(const std::string &key) const
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+            return false;
+        return true;
+    }
+
+    // 获取指定头部字段的值
+    std::string GetHandler(const std::string &key) const
+    {
+        auto it = _headers.find(key);
+        if (it == _headers.end())
+            return "";
+        return it->second;
+    }
+
+    // 插入查询字符串
+    void SetParam(const std::string &key, const std::string &val)
+    {
+        _params.insert(std::make_pair(key, val));
+    }
+
+    // 判断是否有某个指定的查询字符串
+    bool HasParam(const std::string &key) const
+    {
+        auto it = _params.find(key);
+        if (it == _params.end())
+            return false;
+        return true;
+    }
+
+    // 获取指定的查询字符串
+    std::string GetParam(const std::string &key) const
+    {
+        auto it = _params.find(key);
+        if (it == _params.end())
+            return "";
+        return it->second;
+    }
+
+    // 获取正文长度
+    size_t ContentLength()
+    {
+        bool ret = HasHeader("Content-Length");
+        if (ret == false)
+            return 0;
+        std::string clen = GetHandler("Content-Length");
+        return stol(clen);
+    }
+
+    // 判断是否短链接
+    bool Close()
+    {
+        if (HasHeader("Connection") == true && GetHandler("Connection") == "keep-alive")
+            return false;
+        return true;
+    }
+};
+
+class HttpResponse
+{
+public:
+    int _statu;                                            // HTTP状态码（200,404,302）
+    bool _redirect_flag;                                   // 是否需要重定向
+    std::string _body;                                     // 响应正文
+    std::string _redirect_url;                             // 重定向的目标URL
+    std::unordered_map<std::string, std::string> _headers; // 响应头部字典
+public:
+    HttpResponse():_redirect_flag(false),_statu(200){}
+    HttpResponse(int statu):_redirect_flag(false),_statu(statu){}
+    
+    //重置数据
+    void ReSet(){
+        _statu = 200;
+        _redirect_flag = false;
+        _body.clear();
+        _redirect_url.clear();
+        _headers.clear();
+    }
+
+    //插入头部字段
+    void SetHeader(const std::string &key,const std::string &val)
+    {
+        _headers.insert(std::make_pair(key,val));
+    }
+
+    //判断是否存在指定头部字段
+    bool HasHeader(const std::string &key)
+    {
+        return _headers.find(key)!=_headers.end();
+    }
+
+    //获取指定头部字段的值
+    std::string GetHeader(const std::string &key)
+    {
+        auto it = _headers.find(key);
+        if(it==_headers.end())return "";
+        return it->second;
+    }
+
+    //快速设置响应正文，并自动配置Content-Type类型（默认是网页html）
+    void SetContent(const std::string &body,const std::string &type = "text/html")
+    {
+        _body = body;
+        SetHeader("Content-type",type);
+    }
+
+    //快速配置重定向（默认状态码为302 临时重定向）
+    void SetRedirect(const std::string &url,int statu = 302)
+    {
+        _statu = statu;
+        _redirect_flag = true;
+        _redirect_url = url;
+    }
+
+    //判断当前连接是否为短连接
+    bool Close()
+    {
+        if(HasHeader("Connection")&&GetHeader("Connect")=="keep-alive")
+        {
+            return false;
+        }
         return true;
     }
 };
