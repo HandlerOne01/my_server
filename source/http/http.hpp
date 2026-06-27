@@ -298,8 +298,8 @@ public:
         return "Unknow";
     }
 
-    // 根据文件后缀名获取文件mine
-    static std::string ExtMine(const std::string &filename)
+    // 根据文件后缀名获取文件mime
+    static std::string ExtMime(const std::string &filename)
     {
         // a.b.txt  先获取文件扩展名
         size_t pos = filename.find_last_of('.');
@@ -746,5 +746,250 @@ public:
             RecvHttpBody(buf);
         }
         return;
+    }
+};
+
+class HttpServer
+{
+private:
+    using Handler = std::function<void(const HttpRequest &, HttpResponse *)>;
+    using Handlers = std::vector<std::pair<std::regex, Handler>>;
+    Handlers _get_route;    // GET路由表
+    Handlers _post_route;   // POST路由表
+    Handlers _put_route;    // PUT路由表
+    Handlers _delete_route; // DELETE路由表
+
+    std::string _basedir; // 静态资源根目录
+    TcpServer _server;    // TCP服务器
+
+private:
+    // 生成简单的错误页面并写入响应体
+    void ErrorHandler(const HttpRequest &req, HttpResponse *rsp)
+    {
+        // 1.组织一个错误的展示页面
+        std::string body;
+        body += "<html>";
+        body += "<head>";
+        body += "<meta http-equiv='Content-Type' content='text/html;charset=utf-8'>";
+        body += "</head>";
+        body += "<body>";
+        body += "<h1>";
+        body += std::to_string(rsp->_statu);
+        body += " ";
+        body += Util::StatuDesc(rsp->_statu);
+        body += "</h1>";
+        body += "</body>";
+        body += "</html>";
+        // 2. 将页面数据，当作响应正文，放入rsp中
+        rsp->SetContent(body, "text/html");
+    }
+
+    // 将HttpResponse中的要素按照http协议格式进行组织，并发送
+    //  [NOTE] 拼装响应行+响应头+空行+正文，按 HTTP 格式发送
+    void WriteResponse(const PtrConnection &conn, HttpRequest &req, HttpResponse &rsp)
+    {
+        // 1.先完善头部字段
+        if (req.Close())
+            rsp.SetHeader("Connection", "close"); // 短连接
+        else
+            rsp.SetHeader("Connection", "keep-alive"); // 长连接
+
+        if (rsp._body.size() && rsp.HasHeader("Content-length") == false)
+        {
+            rsp.SetHeader("Content-length", std::to_string(rsp._body.size()));
+        }
+        if (rsp._body.size() && rsp.HasHeader("Content-Type") == false)
+        {
+            rsp.SetHeader("Content-Type", "application/octet-stream"); // 默认二进制
+        }
+        if (rsp._redirect_flag == true)
+        {
+            rsp.SetHeader("Location", rsp._redirect_url); // 重定向地址
+        }
+
+        // 将rsp中的要素，按照http协议格式进行组织
+        std::stringstream rsp_str;
+        rsp_str << req._version << " " << std::to_string(rsp._statu) << " " << Util::StatuDesc(rsp._statu) << "\r\n";
+        for (auto &head : rsp._headers)
+        {
+            rsp_str << head.first << ": " << head.second << "\r\n";
+        }
+        rsp_str << "\r\n";
+        rsp_str << rsp._body;
+        // 发送数据
+        conn->Send(rsp_str.str().c_str(), rsp_str.str().size());
+    }
+
+    // 判断该请求是否应该走静态文件处理逻辑
+    bool IsFileHandler(const HttpRequest &req)
+    {
+        // 1.必须设置静态资源根目录
+        if (_basedir.empty())
+            return false;
+
+        // 2.请求方法必须是GET/HEAD
+        if (req._method != "GET" && req._method != "HEAD")
+            return false;
+
+        // 3.请求的资源路径必须是合法路径
+        if (Util::VaildPath(req._path) == false)
+            return false;
+
+        // 4.请求资源必须存在，且是一个普通文件
+        std::string req_path = _basedir + req._path;
+        if (req._path.back() == '/')
+            req_path += "index.html"; // 结尾是/默认访问首页
+        if (Util::IsRegular(req_path) == false)
+            return false;
+
+        return true;
+    }
+
+    // 静态资源的请求处理--将静态资源文件数据读取到rsp._body中并设置MIME类型
+    void FileHandler(const HttpRequest &req, HttpResponse *rsp)
+    {
+        std::string req_path = _basedir + req._path;
+        if (req_path.back() == '/')
+            req_path += "index.html";
+
+        bool ret = Util::ReadFile(req_path, &rsp->_body);
+        if (!ret)
+            return; // 读取失败
+        std::string mime = Util::ExtMime(req_path);
+        rsp->SetHeader("Content-Type", mime);
+        return;
+    }
+
+    // 功能性请求的分类处理
+    // 在指定路由表中按正则匹配查找处理函数并调用，未命中则404
+    void Dispatcher(HttpRequest &req, HttpResponse *rsp, Handlers &handlers)
+    {
+        for (auto &handler : handlers)
+        {
+            const std::regex &re = handler.first;
+            const Handler &functor = handler.second;
+            bool ret = std::regex_match(req._path, req._matches, re);
+            if (ret == false)
+                continue;
+            return functor(req, rsp); // 传入请求信息，和空rsp，执行处理函数
+        }
+        rsp->_statu = 404; // 没有路由匹配
+    }
+
+    // 请求分发入口：静态资源->功能路由->405
+    void Route(HttpRequest &req, HttpResponse *rsp)
+    {
+        if (IsFileHandler(req) == true)
+            return FileHandler(req, rsp);
+        if (req._method == "GET" || req._method == "HEAD")
+            return Dispatcher(req, rsp, _get_route);
+        else if (req._method == "POST")
+            return Dispatcher(req, rsp, _post_route);
+        else if (req._method == "PUT")
+            return Dispatcher(req, rsp, _put_route);
+        else if (req._method == "DELETE")
+            return Dispatcher(req, rsp, _delete_route);
+
+        rsp->_statu = 405; // Method Not Allowed
+        return;
+    }
+
+    // 设置上下文
+    //  新连接建立时，绑定一个 HttpContext 用于解析状态保存
+    void OnConnected(const PtrConnection &conn)
+    {
+        conn->SetContext(HttpContext());
+        DBG_LOG("NEW CONNECTION %p", conn.get());
+    }
+
+    // 缓冲区数据解析+处理
+    // 收到数据时的主处理逻辑：解析请求->出错则错误响应并断联->完整则路由处理并响应
+    void OnMessage(const PtrConnection &conn, Buffer *buffer)
+    {
+        while (buffer->ReadAbleSize() > 0)
+        {
+            // 获取上下文
+            HttpContext *context = conn->Getcontext()->Get<HttpContext>();
+
+            context->RecvHttpRequest(buffer);
+            HttpRequest &req = context->Request();
+            HttpResponse rsp(context->RespStatu());
+
+            // 如果出错则进行错误响应，关闭连接
+            if (context->RespStatu() >= 400)
+            {
+                ErrorHandler(req, &rsp);
+                WriteResponse(conn, req, rsp);
+                context->ReSet();
+                buffer->MoveReadOffset(buffer->ReadAbleSize());
+                conn->ShutDown();
+                return;
+            }
+            // 当前请求还没有接收完整,则退出，等新数据到来再重新继续处理
+            if (context->RecvStatu() != RECV_HTTP_OVER)
+            {
+                return;
+            }
+            // 到这里说明成功
+            // 请求路由，业务处理
+            Route(req, &rsp);
+            // 对HttpResponse进行组织并发送
+            WriteResponse(conn, req, rsp);
+            // 重置上下文
+            context->ReSet();
+            // 短连接则直接关闭
+            if (rsp.Close())
+                conn->ShutDown();
+        }
+        return;
+    }
+
+public:
+    // 构造：初始化TCP服务器、设置空闲超时回收、绑定连接/消息回调
+    HttpServer(int port, int timeout = DEFALT_TIMEOUT) : _server(port)
+    {
+        _server.EnableInactiveRelease(timeout);
+        _server.SetConnectedCallBack(std::bind(&HttpServer::OnConnected, this, std::placeholders::_1));
+        _server.SetMessageCallBack(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
+    }
+    // 设置静态资源根目录（必须是已存在目录）
+    void SetBaseDir(const std::string &path)
+    {
+        assert(Util::IsDirectory(path));
+        _basedir = path;
+    }
+
+    // 设置/添加，请求（请求的正则表达式）与处理函数的映射关系
+    // 注册Get路由
+    void Get(const std::string &pattern, const Handler &handler)
+    {
+        _get_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    // 注册POST路由
+    void Post(const std::string &pattern, const Handler &handler)
+    {
+        _post_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    // 注册PUT路由
+    void Put(const std::string &pattern, const Handler &handler)
+    {
+        _put_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    // 注册DELETE路由
+    void Delete(const std::string &pattern, const Handler &handler)
+    {
+        _delete_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+
+    void SetThreadCount(int count)
+    {
+        _server.SetThreadCount(count);
+    }
+    void Listen()
+    {
+        _server.Start();
     }
 };
