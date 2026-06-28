@@ -350,7 +350,7 @@ public:
     }
 
     // 发送
-    ssize_t Send(void *buf, size_t len, int flag = 0)
+    ssize_t Send(const void *buf, size_t len, int flag = 0)
     {
         // ssize_t send(int sockfd, const void buf[.len], size_t len, int flags);
         int ret = send(_sockfd, buf, len, flag);
@@ -367,7 +367,7 @@ public:
     }
 
     // 非阻塞发送
-    ssize_t NonBlockSend(void *buf, ssize_t len)
+    ssize_t NonBlockSend(const void *buf, ssize_t len)
     {
         if (len == 0)
             return 0;

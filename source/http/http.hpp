@@ -510,7 +510,7 @@ public:
     // 判断当前连接是否为短连接
     bool Close()
     {
-        if (HasHeader("Connection") && GetHeader("Connect") == "keep-alive")
+        if (HasHeader("Connection") && GetHeader("Connection") == "keep-alive")
         {
             return false;
         }

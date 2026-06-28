@@ -46,7 +46,7 @@ int main()
     server.SetBaseDir(WWWROOT);
     server.Get("/hello", Hello);
     server.Post("/login", Login);
-    server.Put("./1234.txt", PutFile);
+    server.Put("/1234.txt", PutFile);
     server.Delete("/1234.txt", DelFile);
     server.Listen();
     return 0;
