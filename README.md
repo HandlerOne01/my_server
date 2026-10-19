@@ -1,8 +1,46 @@
-# my_server
+<div align="center">
+
+<img src="./docs/images/readme/banner.svg" alt="Reactor Server：从一个连接，理解服务器的运行方式。" width="100%" />
+
+<h1>Reactor Server</h1>
+
+<p><b>从一个连接，理解服务器的运行方式。</b></p>
+
+<p><img src="https://img.shields.io/badge/C%2B%2B-11-00599C?style=flat-square" alt="C++ 11" /> <img src="https://img.shields.io/badge/Linux-epoll-88A99C?style=flat-square" alt="Linux epoll" /> <img src="https://img.shields.io/badge/Model-Reactor-B77699?style=flat-square" alt="Model Reactor" /></p>
+
+<p><a href="#功能速览">功能速览</a> · <a href="#架构说明">架构说明</a> · <a href="#快速开始">快速开始</a> · <a href="#当前边界">当前边界</a> · <a href="./README.en.md">English</a></p>
+
+</div>
+
+---
 
 一个基于 **C++11、Linux Socket 和 epoll** 实现的网络服务器学习项目。底层采用多线程 Reactor 模型，封装 TCP 连接、读写缓冲区、事件循环和时间轮定时器；上层提供 TCP Echo 与 HTTP 服务示例。
 
 通过本项目可以了解从 Socket 通信到 HTTP 请求处理的实现过程，以及连接管理、跨线程任务调度和超时回收等网络编程机制。
+
+## 功能速览
+
+<table>
+  <tr>
+    <td width="33%" valign="top"><b>01 / 连接与事件</b><br /><br />基于 epoll 管理就绪事件，主循环接收连接，子循环处理 I/O。</td>
+    <td width="33%" valign="top"><b>02 / 线程与时间</b><br /><br />通过 eventfd 调度跨线程任务，通过 timerfd 和时间轮回收超时连接。</td>
+    <td width="33%" valign="top"><b>03 / 从 TCP 到 HTTP</b><br /><br />提供 Echo 示例、HTTP 请求解析、业务路由和静态文件服务。</td>
+  </tr>
+</table>
+
+```mermaid
+flowchart LR
+    C[客户端] --> A[Acceptor / 主 EventLoop]
+    A --> P[LoopThreadPool]
+    P --> E1[子 EventLoop]
+    P --> E2[子 EventLoop]
+    E1 --> IO[Poller / Channel / Connection]
+    E2 --> IO
+    IO --> B[输入 / 输出 Buffer]
+    B --> H[Echo 回调 / HTTP 处理]
+```
+
+> 这是 Linux 网络编程学习项目，提供 TCP Echo 与基础 HTTP 服务示例。HTTP 协议支持范围和连接处理限制详见下文，不包含并发性能基准承诺。
 
 ## 功能概览
 
@@ -107,7 +145,7 @@ Windows 用户需在安装了编译工具的 Linux WSL 发行版、Linux 虚拟�
 ### 1. 获取代码
 
 ```bash
-git clone https://gitee.com/a2186988646/my_server.git
+git clone https://github.com/HandlerOne01/my_server.git
 cd my_server
 ```
 
@@ -282,3 +320,14 @@ HTTP 服务使用相对路径 `./wwwroot/`。请进入 `source/http` 后运行 `
 ## 许可证
 
 当前仓库未提供 LICENSE 文件，具体使用和分发授权请与仓库作者确认。
+
+## 相关项目
+
+| 项目 | 这里负责什么 |
+| --- | --- |
+| [IMiss Blog](https://github.com/HandlerOne01/IMiss_Blog) | Astro + Svelte 个人技术博客，提供文章阅读与 AI 桌宠入口。 |
+| [Agent for Blog](https://github.com/HandlerOne01/agent_-for_-blog) | LangGraph 博客助手，负责文章推荐、正文介绍与阅读偏好。 |
+| [Boost Search Engine](https://github.com/HandlerOne01/search_engine) | C++ 文档搜索实践，学习分词、索引与结果排序。 |
+| [Reactor Server](https://github.com/HandlerOne01/my_server) | C++ Linux 网络编程实践，学习连接、事件循环与 HTTP。 |
+
+<p align="center"><sub>记录学习，也把每一次实践留成可以回看的路。</sub></p>
