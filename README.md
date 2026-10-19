@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./docs/images/readme/banner.svg" alt="Reactor Server：从一个连接，理解服务器的运行方式。" width="100%" />
+
 
 <h1>Reactor Server</h1>
 
